@@ -1,0 +1,184 @@
+# vllm_custom_patches/patches/priority_scheduler.py
+import logging
+from vllm.core.scheduler import Scheduler
+from vllm_custom_patches.core import VLLMPatch, min_vllm_version
+
+logger = logging.getLogger(__name__)
+
+@min_vllm_version("0.9.1")
+class PrioritySchedulerPatch(VLLMPatch[Scheduler]):
+    """
+    为 vLLM 调度器添加基于优先级的调度。
+    
+    请求可以在其元数据中包含 'priority' 字段。
+    更高优先级的请求会被优先调度。
+    
+    兼容 vLLM 0.9.1+
+    """
+    
+    def schedule_with_priority(self):
+        """
+        增强的调度，尊重请求优先级。
+        
+        此方法可以代替标准 schedule() 调用，
+        以启用优先级感知调度。
+        """
+        # 获取标准调度器输出
+        output = self._schedule()
+        
+        # 如果元数据包含优先级字段，则按优先级排序
+        if hasattr(output, 'scheduled_seq_groups'):
+            output.scheduled_seq_groups.sort(
+                key=lambda seq: getattr(seq, 'priority', 0),
+                reverse=True
+            )
+            
+            logger.debug(
+                f"按优先级顺序调度了 {len(output.scheduled_seq_groups)} 个序列"
+            )
+        
+        return output
+
+
+#https://zhuanlan.zhihu.com/p/1975341583634290364
+
+
+# vllm_custom_patches/__init__.py
+import os
+import logging
+from typing import Dict, List
+
+logger = logging.getLogger(__name__)
+
+class PatchManager:
+    """管理 vLLM 补丁的注册和应用。"""
+    
+    def __init__(self):
+        self.available_patches: Dict[str, type] = {}
+        self.applied_patches: List[str] = []
+    
+    def register(self, name: str, patch_class: type):
+        """注册一个补丁以便稍后应用。"""
+        self.available_patches[name] = patch_class
+        logger.info(f"已注册补丁：{name}")
+    
+    def apply_patch(self, name: str) -> bool:
+        """按名称应用单个补丁。"""
+        if name not in self.available_patches:
+            logger.error(f"未知补丁：{name}")
+            return False
+        
+        try:
+            self.available_patches[name].apply()
+            self.applied_patches.append(name)
+            return True
+        except Exception as e:
+            logger.error(f"应用 {name} 失败：{e}")
+            return False
+    
+    def apply_from_env(self):
+        """
+        应用 VLLM_CUSTOM_PATCHES 环境变量中指定的补丁。
+        
+        格式：VLLM_CUSTOM_PATCHES="PatchOne,PatchTwo"
+        """
+        env_patches = os.environ.get('VLLM_CUSTOM_PATCHES', '').strip()
+        
+        if not env_patches:
+            logger.info("未指定自定义补丁（未设置 VLLM_CUSTOM_PATCHES）")
+            return
+        
+        patch_names = [p.strip() for p in env_patches.split(',') if p.strip()]
+        logger.info(f"正在应用补丁：{patch_names}")
+        
+        for name in patch_names:
+            self.apply_patch(name)
+        
+        logger.info(f"成功应用：{self.applied_patches}")
+
+# 全局管理器实例
+manager = PatchManager()
+
+def register_patches():
+    """
+    vLLM 插件系统调用的主入口点。
+    此函数在 vLLM 启动时自动调用。
+    """
+    logger.info("=" * 60)
+    logger.info("初始化 vLLM 自定义补丁插件")
+    logger.info("=" * 60)
+    
+    # 导入并注册所有可用补丁
+    from vllm_custom_patches.patches.priority_scheduler import PrioritySchedulerPatch
+    
+    manager.register('PriorityScheduler', PrioritySchedulerPatch)
+    
+    # 根据环境配置应用补丁
+    manager.apply_from_env()
+    
+    logger.info("=" * 60)
+
+# setup.py
+from setuptools import setup, find_packages
+
+setup(
+    name='vllm-custom-patches',
+    version='0.1.0',
+    description='通过插件系统实现干净的 vLLM 修改',
+    packages=find_packages(),
+    install_requires=[
+        'vllm>=0.9.1',
+        'packaging>=20.0',
+    ],
+    # 向 vLLM 插件系统注册
+    entry_points={
+        'vllm.general_plugins': [
+            'custom_patches = vllm_custom_patches:register_patches'
+        ]
+    },
+    python_requires='>=3.11',
+)
+
+
+
+# 安装插件包
+#pip install -e .
+
+# 原版 vLLM（无补丁）
+VLLM_CUSTOM_PATCHES="" python -m vllm.entrypoints.openai.api_server \
+    --model mistralai/Mistral-7B-Instruct-v0.2
+
+# 启用优先级调度补丁
+VLLM_CUSTOM_PATCHES="PriorityScheduler" python -m vllm.entrypoints.openai.api_server \
+    --model meta-llama/Meta-Llama-3-70B-Instruct
+
+作者：vLLM
+链接：https://zhuanlan.zhihu.com/p/1975341583634290364
+来源：知乎
+著作权归作者所有。商业转载请联系作者获得授权，非商业转载请注明出处。
+
+# Dockerfile
+FROM vllm/vllm-openai:latest
+
+COPY . /workspace/vllm-custom-patches/
+RUN pip install -e /workspace/vllm-custom-patches/
+
+ENV VLLM_CUSTOM_PATCHES=""
+
+CMD python -m vllm.entrypoints.openai.api_server \
+    --model ${MODEL_NAME} \
+    --host 0.0.0.0 \
+    --port 8000
+# 启用补丁运行
+docker run \
+    -e MODEL_NAME=meta-llama/Meta-Llama-3-70B-Instruct \
+    -e VLLM_CUSTOM_PATCHES="PriorityScheduler" \
+    -p 8000:8000 \
+    vllm-with-patches
+
+# 运行原版 vLLM
+docker run \
+    -e MODEL_NAME=mistralai/Mistral-7B-Instruct-v0.2 \
+    -e VLLM_CUSTOM_PATCHES="" \
+    -p 8000:8000 \
+    vllm-with-patches
